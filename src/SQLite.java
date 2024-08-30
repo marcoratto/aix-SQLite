@@ -26,6 +26,7 @@ SOFTWARE.
 
 package org.bennedum.SQLite;
 
+import android.app.Activity;
 import android.content.Context;
 import android.content.ContentValues;
 import android.database.Cursor;
@@ -33,6 +34,7 @@ import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteCursor;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.database.SQLException;
+import android.os.Build;
 import android.os.AsyncTask;
 import android.os.Environment;
 import android.widget.Toast;
@@ -41,8 +43,20 @@ import com.google.appinventor.components.annotations.*;
 import com.google.appinventor.components.runtime.*;
 import com.google.appinventor.components.common.ComponentCategory;
 import com.google.appinventor.components.common.PropertyTypeConstants;
+import com.google.appinventor.components.common.FileScope;
+import com.google.appinventor.components.runtime.util.IOUtils;
+import com.google.appinventor.components.runtime.util.FileUtil;
+import com.google.appinventor.components.runtime.util.FileAccessMode;
+import com.google.appinventor.components.runtime.util.FileOperation;
 import com.google.appinventor.components.runtime.util.AsynchUtil;
 import com.google.appinventor.components.runtime.util.YailList;
+import com.google.appinventor.components.runtime.util.JsonUtil;
+import com.google.appinventor.components.runtime.util.ScopedFile;
+import com.google.appinventor.components.runtime.util.Synchronizer;
+
+import gnu.math.IntNum;
+
+import org.json.JSONException;
 
 import java.util.ArrayList;
 import java.util.concurrent.ExecutionException;
@@ -70,7 +84,7 @@ import java.io.IOException;
 @SimpleObject(external = true)
 public class SQLite extends AndroidNonvisibleComponent implements Component {
 
-    public static final int VERSION = 1;
+    public static final int VERSION = 3;
     
     private static final String NAME = "SQLite";
     
@@ -83,11 +97,12 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
     
     private ComponentContainer container;
     private Context context;
+    private final Activity activity;
     private boolean isRepl;
     
     private DBHelper dbHelper = null;
     private SQLiteDatabase db = null;
-
+    
     /**
     * Helper class for handling database life cycle events.
     */
@@ -206,7 +221,8 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
         super(container.$form());
         isRepl = form instanceof ReplForm;  // Note: form is defined in our superclass
         this.container = container;
-        context = (Context)container.$context();
+        this.context = (Context)container.$context();
+        this.activity = container.$context();
     }
 
     private void debug(final String message) {
@@ -300,7 +316,7 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
     * Name of the database.
     */
     @DesignerProperty(editorType = PropertyTypeConstants.PROPERTY_TYPE_STRING,
-                      defaultValue = "db.sqlite"
+					  defaultValue = "db.sqlite"
                       )
     @SimpleProperty
     public void DBName(String dbName) {
@@ -349,7 +365,6 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
         this.returnColumnNames = returnColumnNames;
     }
 
-
     //========================================================
     // Utility methods
     //
@@ -359,7 +374,21 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
     */
     @SimpleFunction(description = "Returns the full path to the database, even if it doesn't exist yet.")
     public String DatabasePath() {
-        return context.getDatabasePath(dbName).getPath();
+        return context.getDatabasePath(this.dbName).getPath();
+    }
+    
+    private String getExternalStoragePath() {
+        if (Build.VERSION.SDK_INT >= 29) {
+            return context.getExternalFilesDir((String) null).getAbsolutePath();
+        }
+        return Environment.getExternalStorageDirectory().getAbsolutePath();
+    }
+    
+    private String getReplFilePath() {
+        if (Build.VERSION.SDK_INT >= 29) {
+            return getExternalStoragePath() + "/assets/";
+        }
+        return context.getExternalFilesDir((String) null).getAbsolutePath() + "/AppInventor/assets/";
     }
     
     /**
@@ -369,6 +398,53 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
     public boolean DatabaseExists() {
         return context.getDatabasePath(dbName).exists();
     }
+    
+   @SimpleFunction(
+      description = "fixes multi-column lists from SELECT"
+   )
+   public Object ListFixer(YailList aList) {
+      Object[] var4 = aList.toArray();
+      Object var3 = var4[0];
+      Object var2 = aList;
+      if (!(var3 instanceof IntNum)) {
+         if (var3 instanceof String) {
+            var2 = aList;
+         } else {
+            var2 = this.JsonParse(this.JsonStringify(var4), true);
+         }
+      }
+
+      return var2;
+   }
+   
+      public Object ParseText(String var1, boolean var2) throws IllegalArgumentException {
+      try {
+         Object var4 = JsonUtil.getObjectFromJson(var1, var2);
+         return var4;
+      } catch (JSONException | IllegalArgumentException var3) {
+         throw new IllegalArgumentException("jsonText is not a legal JSON value");
+      }
+   }
+   
+      public Object JsonParse(String var1, boolean var2) {
+      try {
+         Object var3 = this.ParseText(var1, var2);
+         return var3;
+      } catch (IllegalArgumentException var4) {
+         this.form.dispatchErrorOccurredEvent(this, "JsonParse", 1105, new Object[]{var1});
+         return "";
+      }
+   }
+
+   public String JsonStringify(Object var1) {
+      try {
+         String var2 = JsonUtil.encodeJsonObject(var1);
+         return var2;
+      } catch (IllegalArgumentException var3) {
+         this.form.dispatchErrorOccurredEvent(this, "JsonStringify", 1118, new Object[]{var1});
+         return "";
+      }
+   }
     
     /**
     * Delete the database.
@@ -393,9 +469,55 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
                                 + "Returns true if the import was successful, false otherwise."
                     )
     public boolean ImportDatabase(String fileName) {
+		boolean out = false;
         if (db != null) {
             debugException(new Exception("Unable to import when the database is open."));
-            return false;
+            return out;
+        }
+        InputStream is = null;
+        OutputStream os = null;
+        out = false;
+        try {
+            is = openInputStream(fileName);
+            os = new FileOutputStream(context.getDatabasePath(dbName));
+            byte[] buf = new byte[1024];
+            int len;
+            while ((len = is.read(buf)) > 0)
+                os.write(buf, 0, len);
+            
+            os.flush();
+            debug("Database imported");
+            out = true;
+        } catch (IOException e) {
+            debugException(e);
+            out = false;
+        } finally {
+            try {
+                if (is != null) is.close();
+                if (os != null) os.close();
+            } catch (IOException e) {}
+        }
+        return out;
+    }
+    
+   /**
+    * Import a SQLite database file.
+    * This is probably not best done on the main thread.
+    */
+    @SimpleFunction(description = "Imports a SQLite database completely replacing the currently closed database. "
+                                + "Returns true if the import was successful, false otherwise."
+                    )
+    public void ImportDatabaseASync(final String fileName) {
+		final String method = "ImportDatabaseASync";
+		
+		AsynchUtil.runAsynchronously(new Runnable() {
+            @Override
+            public void run() {
+
+        if (db != null) {
+            debugException(new Exception("Unable to import when the database is open."));
+            BackToUiThread(false, "Unable to import when the database is open.");
+            return;
         }
         InputStream is = null;
         OutputStream os = null;
@@ -406,19 +528,38 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
             int len;
             while ((len = is.read(buf)) > 0)
                 os.write(buf, 0, len);
+            
+            os.flush();
             debug("Database imported");
-            return true;
+            BackToUiThread(true, "successfull");
         } catch (IOException e) {
             debugException(e);
-            return false;
+            BackToUiThread(false, e.getMessage());
         } finally {
             try {
                 if (is != null) is.close();
                 if (os != null) os.close();
             } catch (IOException e) {}
         }
+            }
+        });
+
+    }
+        
+    private void BackToUiThread(final boolean successful, final String response) {
+           this.activity.runOnUiThread(new Runnable() {
+                public void run() {
+                    SQLite.this.Imported(successful, response);
+                }
+            });
     }
     
+    @SimpleEvent(description = "Event indicating that import of the DB filename has finished.")
+    public void Imported(boolean successful, String response) {
+        debug("Imported");
+        EventDispatcher.dispatchEvent(this, "Imported", new Object[]{Boolean.valueOf(successful), response});
+    }
+
     /**
     * Exports the database.
     * This is probably not best done on the main thread.
@@ -487,6 +628,7 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
             });
         }
     }
+    
             
     /**
     * Closes the database.
@@ -1442,13 +1584,13 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
       @return an InputStream
     */
     private InputStream openInputStream(final String fileName) throws IOException {
-        if (fileName.startsWith("//")) {
-            if (isRepl)
-                return new FileInputStream(Environment.getExternalStorageDirectory().getPath() + "/AppInventor/assets/" + fileName);
-            else
-                return context.getAssets().open(fileName.substring(2));
-        } else
+        if (!fileName.startsWith("//")) {
             return new FileInputStream(resolveFileName(fileName));
+        }
+        if (!this.isRepl) {
+            return context.getAssets().open(fileName.substring(2));
+        }
+        return new FileInputStream(getReplFilePath() + fileName.substring(2));          
     }
             
     /**
@@ -1459,8 +1601,9 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
     */
     
     private String resolveFileName(final String fileName) {
-        if (fileName.startsWith("/"))
+        if (fileName.startsWith("/")) {
             return Environment.getExternalStorageDirectory().getPath() + fileName;
+		}
         File dirPath = context.getFilesDir();
         if (isRepl) {
             String path = Environment.getExternalStorageDirectory().getPath() + "/AppInventor/data/";
@@ -1471,9 +1614,6 @@ public class SQLite extends AndroidNonvisibleComponent implements Component {
         }
         return dirPath.getPath() + "/" + fileName;
     }
-    
-
-
                 
     // ==========================================
     // Events
